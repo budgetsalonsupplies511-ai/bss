@@ -5,21 +5,22 @@ import express from "express";
 dotenv.config();
 
 const app = express();
-const connectorVersion = "2026-07-31-branch-transfer-v1";
+const connectorVersion = "2026-08-10-zero-stock-product-option-v3";
 const port = Number(process.env.PORT || 3000);
 const cin7Username = process.env.CIN7_API_USERNAME || "";
 const cin7ApiKey = process.env.CIN7_API_KEY || "";
 const cin7BaseUrl = (process.env.CIN7_API_BASE_URL || "https://api.cin7.com/api/v1").replace(/\/+$/, "");
 const allowedOrigin = process.env.ALLOWED_ORIGIN || "*";
-const searchCacheMs = 10 * 60 * 1000;
+const searchCacheMs = Number(process.env.CIN7_SEARCH_CACHE_MS || 60 * 60 * 1000);
 const searchPageLimit = Number(process.env.CIN7_SEARCH_PAGE_LIMIT || 100);
 const searchRowsPerPage = Number(process.env.CIN7_SEARCH_ROWS_PER_PAGE || 100);
 const searchRequestDelayMs = Number(process.env.CIN7_SEARCH_REQUEST_DELAY_MS || 300);
+const cin7RetryAfterMs = Number(process.env.CIN7_RETRY_AFTER_MS || 10000);
 const stockUpdatePin = process.env.CIN7_STOCK_UPDATE_PIN || "";
 const branchTransferPin = process.env.CIN7_BRANCH_TRANSFER_PIN || stockUpdatePin;
 const stockUpdateAutoApprove = String(process.env.CIN7_STOCK_UPDATE_AUTO_APPROVE || "true").toLowerCase() !== "false";
 const cin7WriteTimeoutMs = Number(process.env.CIN7_WRITE_TIMEOUT_MS || 55000);
-let productSearchCache = { expiresAt: 0, rows: [] };
+let productSearchCache = emptyProductSearchCache();
 let productSearchWarmup = null;
 const updateJobs = new Map();
 
@@ -46,6 +47,7 @@ app.get("/api/diagnostics", (_req, res) => {
     searchPageLimit,
     searchRowsPerPage,
     searchRequestDelayMs,
+    cin7RetryAfterMs,
     searchCache: cacheStatus()
   });
 });
@@ -90,42 +92,53 @@ app.get("/api/lookup", async (req, res) => {
   if (!code) return res.status(400).json({ error: "Missing barcode" });
 
   try {
-    const lookup = await findStockRows(code);
-    const stock = chooseStockRow(lookup.rows, code, branchId);
-    if (!stock) return res.status(404).json({ error: "No Cin7 Omni product matched this barcode" });
+    const cachedMatch = await getCachedProductByCode(code);
+    let lookup = { matchType: cachedMatch ? "product_cache" : "none", rows: [] };
+    let stock = null;
 
-    const productOptionId = stock.productOptionId ?? stock.ProductOptionId;
-    const productId = stock.productId ?? stock.ProductId;
-    const option = await getBestProductOption(productId, productOptionId, code);
-    const product = productId ? await getProduct(productId) : null;
-    const name = buildProductName(stock, option);
-    const selectedBranchId = stock.branchId ?? stock.BranchId ?? "";
-    const selectedBranchName = stock.branchName ?? stock.BranchName ?? "";
-    const stockOnHand = stock.stockOnHand ?? stock.StockOnHand ?? stock.available ?? stock.Available ?? "";
-    const priceTiers = mergePriceTiers(extractPriceTiers(option, option), extractPriceTiers(stock, stock));
-    const imageUrl = imageUrlFrom(option, product, stock);
+    if (branchId || !cachedMatch) {
+      try {
+        lookup = await findStockRows(code);
+        stock = chooseStockRow(lookup.rows, code, branchId);
+      } catch (error) {
+        if (!cachedMatch) throw error;
+      }
+    }
+
+    if (!stock && !cachedMatch) return res.status(404).json({ error: "No Cin7 Omni product matched this barcode" });
+
+    const productOptionId = stock?.productOptionId ?? stock?.ProductOptionId ?? cachedMatch?.productOptionId ?? "";
+    const productId = stock?.productId ?? stock?.ProductId ?? cachedMatch?.productId ?? "";
+    const option = await getBestProductOption(productId, productOptionId, code).catch(() => null);
+    const product = productId && !cachedMatch?.productTitle ? await getProduct(productId).catch(() => null) : null;
+    const name = buildProductName(stock || cachedMatch || {}, option || cachedMatch || {}, product || cachedMatch || null);
+    const selectedBranchId = stock?.branchId ?? stock?.BranchId ?? "";
+    const selectedBranchName = stock?.branchName ?? stock?.BranchName ?? "";
+    const stockOnHand = stock?.stockOnHand ?? stock?.StockOnHand ?? stock?.available ?? stock?.Available ?? "";
+    const priceTiers = mergePriceTiers(mergePriceTiers(extractPriceTiers(option, option), cachedMatch?.priceTiers), extractPriceTiers(stock, stock));
+    const imageUrl = imageUrlFrom(option, product, stock, cachedMatch);
 
     res.json({
-      barcode: stock.barcode ?? stock.Barcode ?? stock.productOptionBarcode ?? stock.ProductOptionBarcode ?? stock.productOptionSizeBarcode ?? stock.ProductOptionSizeBarcode ?? code,
-      sku: stock.code ?? stock.Code ?? "",
+      barcode: barcodeValue(stock) || cachedMatch?.barcode || barcodeValue(option) || code,
+      sku: skuValue(stock) || cachedMatch?.sku || skuValue(option) || "",
       price: priceTiers.special || priceTiers.retail || "",
       priceSource: priceTiers.special ? "special" : "retail",
       priceTiers,
       imageUrl,
-      productTitle: name,
+      productTitle: cleanName(name) || cachedMatch?.productTitle || skuValue(stock) || cachedMatch?.sku || code,
       variantTitle: "",
       productId: productId ?? "",
       productOptionId: productOptionId || "",
       locationId: String(selectedBranchId),
       locationName: String(selectedBranchName),
       cin7Quantity: stockOnHand,
-      matchType: lookup.matchType,
+      matchType: stock ? lookup.matchType : "product_cache",
       cin7Stock: {
-        available: stock.available ?? stock.Available ?? "",
-        stockOnHand: stock.stockOnHand ?? stock.StockOnHand ?? "",
-        openSales: stock.openSales ?? stock.OpenSales ?? "",
-        incoming: stock.incoming ?? stock.Incoming ?? "",
-        holding: stock.holding ?? stock.Holding ?? ""
+        available: stock?.available ?? stock?.Available ?? "",
+        stockOnHand: stock?.stockOnHand ?? stock?.StockOnHand ?? "",
+        openSales: stock?.openSales ?? stock?.OpenSales ?? "",
+        incoming: stock?.incoming ?? stock?.Incoming ?? "",
+        holding: stock?.holding ?? stock?.Holding ?? ""
       }
     });
   } catch (error) {
@@ -394,11 +407,15 @@ async function findStockRows(code) {
 }
 
 async function searchProductsByName(query) {
-  const directMatches = await searchProductsDirect(query);
-  if (directMatches.length) return dedupeSearchResults(directMatches);
-
   const productMatches = await searchProducts(query);
-  return dedupeSearchResults(productMatches);
+  if (productMatches.length) return dedupeSearchResults(productMatches);
+
+  if (productSearchWarmup) {
+    return [];
+  }
+
+  const directMatches = await searchProductsDirect(query);
+  return dedupeSearchResults(directMatches);
 }
 
 async function searchProductsDirect(query) {
@@ -419,23 +436,16 @@ async function searchProductsDirect(query) {
 }
 
 async function searchProducts(query) {
-  const products = await getCachedProducts();
+  await getCachedProducts();
   const words = searchWords(query);
-  return products
-    .filter((product) => matchesWords(searchTextForProduct(product), words))
-    .flatMap((product) => {
-      const productName = product.name ?? product.Name ?? product.productName ?? product.ProductName ?? "";
-      const productId = product.id ?? product.Id ?? product.ID;
-      const options = asArray(product.productOptions ?? product.ProductOptions ?? product.options ?? product.Options);
-      if (!options.length) return [searchResultFromOption({ productName, productId }, product)];
-
-      return options.map((option) => searchResultFromOption({ ...option, productName, productId }, product));
-    });
+  return productSearchCache.results
+    .filter((row) => matchesWords(row.searchText, words))
+    .map(publicSearchResult);
 }
 
 function searchResultFromOption(option, product = null) {
   const priceTiers = extractPriceTiers(option, option);
-  const name = buildProductName(option, option);
+  const name = buildProductName(option, option, product);
   return {
     barcode: barcodeValue(option),
     sku: option.code ?? option.Code ?? option.productOptionCode ?? option.ProductOptionCode ?? "",
@@ -466,7 +476,7 @@ async function stockRowToSearchResult(stock) {
     priceSource: priceTiers.special ? "special" : "retail",
     priceTiers,
     imageUrl: imageUrlFrom(option, product, stock),
-    productTitle: buildProductName(stock, option),
+    productTitle: buildProductName(stock, option, product),
     variantTitle: "",
     productId: productId ?? option?.productId ?? option?.ProductId ?? "",
     productOptionId: productOptionId ?? option?.id ?? option?.Id ?? option?.ID ?? "",
@@ -478,7 +488,7 @@ async function stockRowToSearchResult(stock) {
 async function productOptionToSearchResult(option) {
   const productId = option.productId ?? option.ProductId;
   const product = productId ? await getProduct(productId) : null;
-  const productName = product?.name ?? product?.Name ?? product?.productName ?? product?.ProductName ?? option.productName ?? option.ProductName ?? "";
+  const productName = productNameFrom(product) || productNameFrom(option);
   return searchResultFromOption({
     ...option,
     productName,
@@ -511,7 +521,7 @@ async function warmProductCache() {
 
   productSearchWarmup = fetchProductPages(searchPageLimit, searchRowsPerPage, true)
     .then((rows) => {
-      productSearchCache = { expiresAt: Date.now() + searchCacheMs, rows };
+      productSearchCache = buildProductSearchCache(rows, Date.now() + searchCacheMs);
       return rows;
     })
     .finally(() => {
@@ -527,9 +537,79 @@ function cacheStatus() {
     warm: productSearchCache.expiresAt > now && productSearchCache.rows.length > 0,
     warming: Boolean(productSearchWarmup),
     count: productSearchCache.rows.length,
+    indexedProducts: productSearchCache.results.length,
+    indexedBarcodes: productSearchCache.byBarcode.size,
+    indexedSkus: productSearchCache.bySku.size,
     expiresAt: productSearchCache.expiresAt ? new Date(productSearchCache.expiresAt).toISOString() : "",
     expiresInSeconds: productSearchCache.expiresAt > now ? Math.round((productSearchCache.expiresAt - now) / 1000) : 0
   };
+}
+
+async function getCachedProductByCode(code) {
+  if (!normaliseLookupCode(code)) return null;
+  await getCachedProducts();
+  const key = indexKey(code);
+  return productSearchCache.byBarcode.get(key) || productSearchCache.bySku.get(key) || null;
+}
+
+function emptyProductSearchCache() {
+  return {
+    expiresAt: 0,
+    rows: [],
+    results: [],
+    byBarcode: new Map(),
+    bySku: new Map(),
+    byOptionId: new Map()
+  };
+}
+
+function buildProductSearchCache(rows, expiresAt) {
+  const cache = emptyProductSearchCache();
+  cache.expiresAt = expiresAt;
+  cache.rows = rows;
+
+  rows.forEach((product) => {
+    const productName = productNameFrom(product);
+    const productId = product.id ?? product.Id ?? product.ID;
+    const options = asArray(product.productOptions ?? product.ProductOptions ?? product.options ?? product.Options);
+    const optionRows = options.length ? options : [{ productName, productId }];
+
+    optionRows.forEach((option) => {
+      const result = searchResultFromOption({ ...option, productName, productId }, product);
+      result.searchText = searchTextForSearchResult(result, product, option);
+      cache.results.push(result);
+
+      addCacheIndex(cache.byBarcode, result.barcode, result);
+      addCacheIndex(cache.bySku, result.sku, result);
+      addCacheIndex(cache.byOptionId, result.productOptionId, result);
+    });
+  });
+
+  return cache;
+}
+
+function addCacheIndex(index, value, row) {
+  const key = indexKey(value);
+  if (key && !index.has(key)) index.set(key, row);
+}
+
+function indexKey(value) {
+  return normaliseLookupCode(value).toLowerCase();
+}
+
+function publicSearchResult(row) {
+  const { searchText: _searchText, ...publicRow } = row;
+  return publicRow;
+}
+
+function searchTextForSearchResult(row, product = null, option = null) {
+  return [
+    row.productTitle,
+    row.sku,
+    row.barcode,
+    searchTextForProduct(product),
+    searchTextForProductOption(option)
+  ].map((value) => String(value ?? "")).join(" ");
 }
 
 async function fetchProductPages(pageCount, rows, stopWhenShort = true) {
@@ -567,12 +647,17 @@ function normaliseSearchText(value) {
 }
 
 function searchTextForProduct(product) {
+  if (!product) return "";
   const options = asArray(product.productOptions ?? product.ProductOptions ?? product.options ?? product.Options);
   return [
     product.name,
     product.Name,
     product.productName,
     product.ProductName,
+    product.productTitle,
+    product.ProductTitle,
+    product.description,
+    product.Description,
     product.code,
     product.Code,
     product.sku,
@@ -582,11 +667,16 @@ function searchTextForProduct(product) {
 }
 
 function searchTextForProductOption(option) {
+  if (!option) return "";
   return [
     option.productName,
     option.ProductName,
+    option.productTitle,
+    option.ProductTitle,
     option.name,
     option.Name,
+    option.description,
+    option.Description,
     option.option1,
     option.Option1,
     option.option2,
@@ -716,12 +806,16 @@ async function cin7Get(path, params = {}) {
     if (value !== "" && value !== null && value !== undefined) url.searchParams.set(key, value);
   }
 
-  const response = await fetch(url, {
-    headers: {
-      "Accept": "application/json",
-      "Authorization": `Basic ${Buffer.from(`${cin7Username}:${cin7ApiKey}`).toString("base64")}`
-    }
+  let response = await fetch(url, {
+    headers: cin7Headers()
   });
+
+  if (response.status === 429) {
+    await sleep(cin7RetryAfterMs);
+    response = await fetch(url, {
+      headers: cin7Headers()
+    });
+  }
 
   const json = await readJsonResponse(response, "Cin7 Omni API");
   if (!response.ok) {
@@ -741,9 +835,8 @@ async function cin7Send(method, path, body) {
     response = await fetch(`${cin7BaseUrl}${path}`, {
       method,
       headers: {
-        "Accept": "application/json",
+        ...cin7Headers(),
         "Content-Type": "application/json",
-        "Authorization": `Basic ${Buffer.from(`${cin7Username}:${cin7ApiKey}`).toString("base64")}`
       },
       body: JSON.stringify(body),
       signal: controller.signal
@@ -763,6 +856,13 @@ async function cin7Send(method, path, body) {
     throw new Error(message);
   }
   return json;
+}
+
+function cin7Headers() {
+  return {
+    "Accept": "application/json",
+    "Authorization": `Basic ${Buffer.from(`${cin7Username}:${cin7ApiKey}`).toString("base64")}`
+  };
 }
 
 async function runStockUpdateJob(jobId, adjustment) {
@@ -835,12 +935,22 @@ async function repairStocktakeItem(item, branchId = "") {
     return item;
   }
 
-  const lookupCode = String(item.code || item.barcode || item.sku || "").trim();
-  if (!lookupCode) return item;
+  // Older clients could store the typed name-search query in `code`. Try the
+  // actual barcode and SKU first so those saved stocktake lines remain usable.
+  const lookupCodes = [...new Set([item.barcode, item.sku, item.code]
+    .map((value) => String(value || "").trim())
+    .filter(Boolean))];
+  if (!lookupCodes.length && (!Number.isFinite(productOptionId) || productOptionId <= 0)) return item;
 
   try {
-    const lookup = await findStockRows(lookupCode);
-    const stock = chooseStockRow(lookup.rows, lookupCode, String(branchId || ""));
+    let stock = Number.isFinite(productOptionId) && productOptionId > 0
+      ? await findStockByProductOptionId(productOptionId, branchId)
+      : null;
+    for (const lookupCode of lookupCodes) {
+      const lookup = await findStockRows(lookupCode);
+      stock = chooseStockRow(lookup.rows, lookupCode, String(branchId || ""));
+      if (stock) break;
+    }
     if (!stock) return item;
 
     const repairedProductOptionId = stock.productOptionId ?? stock.ProductOptionId ?? item.productOptionId;
@@ -856,6 +966,17 @@ async function repairStocktakeItem(item, branchId = "") {
   } catch {
     return item;
   }
+}
+
+async function findStockByProductOptionId(productOptionId, branchId = "") {
+  const clauses = [`productOptionId=${Number(productOptionId)}`];
+  const numericBranchId = numericValue(branchId);
+  if (Number.isFinite(numericBranchId) && numericBranchId > 0) clauses.push(`branchId=${numericBranchId}`);
+  const rows = asArray(await cin7Get("/Stock", { where: clauses.join(" AND "), rows: "20" }));
+  return rows.find((row) =>
+    Number(row.productOptionId ?? row.ProductOptionId) === Number(productOptionId) &&
+    (!branchId || String(row.branchId ?? row.BranchId) === String(branchId))
+  ) || null;
 }
 
 function numericValue(value) {
@@ -989,15 +1110,49 @@ function normaliseLookupCode(value) {
   return String(value ?? "").trim().replace(/\s+/g, " ");
 }
 
-function buildProductName(stock, option) {
-  const base = stock.productName ?? stock.ProductName ?? "";
+function buildProductName(stock, option, product = null) {
+  const base = productNameFrom(stock, option, product);
   const parts = [
+    option?.name ?? option?.Name,
+    option?.label ?? option?.Label,
+    option?.title ?? option?.Title,
     option?.option1 ?? option?.Option1 ?? stock.option1 ?? stock.Option1,
     option?.option2 ?? option?.Option2 ?? stock.option2 ?? stock.Option2,
     option?.option3 ?? option?.Option3 ?? stock.option3 ?? stock.Option3,
     option?.size ?? option?.Size ?? stock.size ?? stock.Size
-  ].filter(Boolean);
-  return [base, parts.join(" / ")].filter(Boolean).join(" - ") || "Unnamed item";
+  ].filter((part) => cleanName(part) && cleanName(part) !== cleanName(base));
+  return [base, parts.join(" / ")].filter(Boolean).join(" - ") || skuValue(stock) || skuValue(option) || barcodeValue(stock) || barcodeValue(option) || "Unnamed item";
+}
+
+function productNameFrom(...sources) {
+  for (const source of sources) {
+    const name = [
+      source?.productName,
+      source?.ProductName,
+      source?.productTitle,
+      source?.ProductTitle,
+      source?.name,
+      source?.Name,
+      source?.title,
+      source?.Title,
+      source?.label,
+      source?.Label,
+      source?.description,
+      source?.Description
+    ].map(cleanName).find(Boolean);
+    if (name) return name;
+  }
+  return "";
+}
+
+function cleanName(value) {
+  const text = String(value ?? "").trim();
+  if (!text || /^untitled$/i.test(text) || /^unnamed/i.test(text)) return "";
+  return text;
+}
+
+function skuValue(row) {
+  return row?.sku ?? row?.SKU ?? row?.code ?? row?.Code ?? row?.productOptionCode ?? row?.ProductOptionCode ?? "";
 }
 
 function imageUrlFrom(...sources) {
@@ -1133,4 +1288,9 @@ function sendError(res, error) {
 
 app.listen(port, () => {
   console.log(`Scanner Cin7 Omni connector running on port ${port}`);
+  if (cin7Username && cin7ApiKey) {
+    warmProductCache()
+      .then((rows) => console.log(`Cin7 product cache warmed with ${rows.length} products`))
+      .catch((error) => console.warn(`Cin7 product cache warmup failed: ${error.message || error}`));
+  }
 });

@@ -5,7 +5,7 @@ import express from "express";
 dotenv.config();
 
 const app = express();
-const connectorVersion = "2026-08-10-zero-stock-product-option-v3";
+const connectorVersion = "2026-08-10-async-stock-preparation-v4";
 const port = Number(process.env.PORT || 3000);
 const cin7Username = process.env.CIN7_API_USERNAME || "";
 const cin7ApiKey = process.env.CIN7_API_KEY || "";
@@ -248,7 +248,7 @@ app.get("/api/debug-search", async (req, res) => {
   }
 });
 
-app.post("/api/stocktake-adjustment", async (req, res) => {
+app.post("/api/stocktake-adjustment", (req, res) => {
   try {
     if (!stockUpdatePin) return res.status(403).json({ error: "Cin7 stock update is not enabled on this backend" });
     if (String(req.body.pin || "") !== stockUpdatePin) return res.status(401).json({ error: "Wrong update PIN" });
@@ -258,23 +258,46 @@ app.post("/api/stocktake-adjustment", async (req, res) => {
     const items = asArray(req.body.items);
     if (!Number.isFinite(branchId) || branchId <= 0) return res.status(400).json({ error: "Missing Cin7 branch" });
 
+    const jobId = stocktakeReference();
+    const job = {
+      id: jobId,
+      status: "preparing",
+      reference: jobId,
+      branchId,
+      branchName,
+      approved: stockUpdateAutoApprove,
+      lineCount: 0,
+      adjustmentTotal: 0,
+      createdAt: new Date().toISOString(),
+      completedAt: "",
+      result: null,
+      error: "",
+      request: null
+    };
+    updateJobs.set(jobId, job);
+    prepareAndRunStockUpdateJob(jobId, items, branchId, branchName);
+    res.json({ ok: true, queued: true, jobId, ...job });
+  } catch (error) {
+    sendError(res, error);
+  }
+});
+
+async function prepareAndRunStockUpdateJob(jobId, items, branchId, branchName) {
+  const job = updateJobs.get(jobId);
+  if (!job) return;
+  try {
     const parsedLines = await Promise.all(items.map((item, index) => stocktakeItemToAdjustmentLine(item, index, branchId)));
     const skippedLines = parsedLines.filter((line) => !line.ok).map((line) => line.reason);
-    const lineItems = parsedLines
-      .filter((line) => line.ok)
-      .map((line) => line.line)
-      .filter((line) => line.qty !== 0);
-
+    const lineItems = parsedLines.filter((line) => line.ok).map((line) => line.line).filter((line) => line.qty !== 0);
     if (!lineItems.length) {
-      return res.status(400).json({
-        error: "No valid stock differences to update",
-        received: items.length,
-        skipped: skippedLines.slice(0, 10),
-        note: "A valid stock update needs Cin7 productOptionId, current stock, and counted stock. Counted 0 is valid when current stock is above 0."
-      });
+      job.status = "failed";
+      job.error = skippedLines.length
+        ? `No valid stock differences to update. ${skippedLines[0].name || skippedLines[0].sku || skippedLines[0].code || "Line"}: ${skippedLines[0].issue}.`
+        : "No stock differences to update; counted stock already matches Cin7.";
+      job.completedAt = new Date().toISOString();
+      updateJobs.set(jobId, job);
+      return;
     }
-
-    const jobId = stocktakeReference();
     const adjustment = {
       isApproved: stockUpdateAutoApprove,
       reference: jobId,
@@ -284,29 +307,19 @@ app.post("/api/stocktake-adjustment", async (req, res) => {
       source: "Stocktake app",
       lineItems
     };
-
-    const job = {
-      id: jobId,
-      status: "queued",
-      reference: jobId,
-      branchId,
-      branchName,
-      approved: stockUpdateAutoApprove,
-      lineCount: lineItems.length,
-      adjustmentTotal: lineItems.reduce((total, line) => total + line.qty, 0),
-      createdAt: new Date().toISOString(),
-      completedAt: "",
-      result: null,
-      error: "",
-      request: adjustment
-    };
+    job.status = "queued";
+    job.lineCount = lineItems.length;
+    job.adjustmentTotal = lineItems.reduce((total, line) => total + line.qty, 0);
+    job.request = adjustment;
     updateJobs.set(jobId, job);
-    runStockUpdateJob(jobId, adjustment);
-    res.json({ ok: true, queued: true, jobId, ...job });
+    await runStockUpdateJob(jobId, adjustment);
   } catch (error) {
-    sendError(res, error);
+    job.status = "failed";
+    job.error = error.message || "Could not prepare Cin7 stock update";
+    job.completedAt = new Date().toISOString();
+    updateJobs.set(jobId, job);
   }
-});
+}
 
 app.get("/api/stocktake-adjustment-status/:jobId", (req, res) => {
   const job = updateJobs.get(String(req.params.jobId || ""));

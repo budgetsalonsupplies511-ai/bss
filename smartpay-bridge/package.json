@@ -1,0 +1,13 @@
+{
+  "name": "bss-cin7-smartpay-bridge",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Local bridge scaffold between Cin7 Omni payment flow and Smartpay SmartConnect",
+  "main": "src/server.js",
+  "scripts": {
+    "start": "node src/server.js"
+  },
+  "engines": {
+    "node": ">=20"
+  }
+}
